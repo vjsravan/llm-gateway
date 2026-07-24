@@ -13,6 +13,11 @@ mvn spring-boot:run   # dashboard at http://localhost:8080
 ./benchmark.sh        # drives representative traffic, prints measured results
 ```
 
+![LLM Gateway dashboard showing 36 requests, 69.4% cache hit rate, $5.61 cost saved, p95 latency, and per-provider circuit breaker state](docs/dashboard.png)
+
+*The dashboard after one `./benchmark.sh` run. Every number is live from `/v1/stats`;
+the provider table shows each circuit breaker's state and rolling failure rate.*
+
 ---
 
 ## The problem
