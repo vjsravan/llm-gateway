@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LLM Gateway — live</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#16161a;--dim:#6b6b76;--line:#e4e4e8;
+      --accent:#2b6cb0;--good:#0a7f43;--warn:#b7791f;--bad:#c0392b;}
+@media(prefers-color-scheme:dark){:root{--bg:#101014;--fg:#e9e9ee;--dim:#9797a3;--line:#28282f;}}
+*{box-sizing:border-box}
+body{margin:0;padding:2rem 1.25rem;background:var(--bg);color:var(--fg);
+     font:15px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:1000px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:.75rem;flex-wrap:wrap;margin-bottom:.35rem}
+h1{font-size:1.35rem;margin:0;letter-spacing:-.01em}
+.pill{font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;padding:.2rem .5rem;
+      border:1px solid var(--line);border-radius:999px;color:var(--dim)}
+.sub{color:var(--dim);font-size:.85rem;margin-bottom:1.75rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:.7rem;margin-bottom:1.75rem}
+.card{border:1px solid var(--line);border-radius:10px;padding:.85rem .95rem}
+.card .k{font-size:.66rem;text-transform:uppercase;letter-spacing:.07em;color:var(--dim)}
+.card .v{font-size:1.55rem;font-weight:640;margin-top:.15rem;font-variant-numeric:tabular-nums}
+.card .n{font-size:.72rem;color:var(--dim);margin-top:.1rem}
+.card.hl .v{color:var(--good)}
+h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:1.75rem 0 .55rem}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{text-align:left;padding:.5rem .8rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);font-weight:600}
+tr:last-child td{border-bottom:none}
+.state{font-weight:650;font-size:.78rem}
+.CLOSED{color:var(--good)}.HALF_OPEN{color:var(--warn)}.OPEN{color:var(--bad)}
+.bar{height:6px;border-radius:3px;background:color-mix(in srgb,var(--fg) 10%,transparent);overflow:hidden;min-width:90px}
+.bar>i{display:block;height:100%;background:var(--accent)}
+form{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem}
+input,button{font:inherit;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--line);
+             background:var(--bg);color:var(--fg)}
+input{flex:1;min-width:240px}
+button{cursor:pointer;font-weight:600;border-color:var(--accent);color:var(--accent)}
+button:hover{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+pre{margin:0;padding:.8rem;border:1px solid var(--line);border-radius:10px;overflow-x:auto;
+    font:.8rem ui-monospace,"SF Mono",Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.muted{color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LLM Gateway</h1>
+    <span class="pill" id="live">live</span>
+  </header>
+  <div class="sub">Semantic cache · confidence routing · circuit breaking · per-tenant budgets</div>
+
+  <div class="grid" id="cards"></div>
+
+  <h2>Try it</h2>
+  <form id="ask">
+    <input id="prompt" value="what is the customs status of shipment AWB 125-44821903" aria-label="prompt">
+    <button type="submit">Send</button>
+  </form>
+  <pre id="out" class="muted">Send a request, then send a near-identical one to watch the semantic cache take over.</pre>
+
+  <h2>Providers</h2>
+  <div class="tablewrap">
+    <table><thead><tr><th>provider</th><th>tier</th><th>$/1k</th><th>breaker</th><th>failure rate</th><th>requests</th></tr></thead>
+    <tbody id="providers"></tbody></table>
+  </div>
+</div>
+
+<script>
+const fmtUsd = n => '$' + Number(n).toFixed(4);
+const pct = n => (Number(n) * 100).toFixed(1) + '%';
+
+function card(k, v, note, hl) {
+  return `<div class="card${hl ? ' hl' : ''}"><div class="k">${k}</div><div class="v">${v}</div>${
+    note ? `<div class="n">${note}</div>` : ''}</div>`;
+}
+
+async function refresh() {
+  let s;
+  try {
+    s = await (await fetch('/v1/stats')).json();
+    document.getElementById('live').textContent = 'live';
+  } catch {
+    document.getElementById('live').textContent = 'offline';
+    return;
+  }
+
+  document.getElementById('cards').innerHTML = [
+    card('requests', s.requests),
+    card('cache hit rate', pct(s.cacheHitRate),
+         s.cacheHits + ' hits · mean sim ' + Number(s.meanHitSimilarity).toFixed(3)),
+    card('cost saved', fmtUsd(s.costSavedUsd),
+         pct(s.costSavedRatio) + ' vs all-premium', true),
+    card('actual spend', fmtUsd(s.actualCostUsd), 'vs ' + fmtUsd(s.counterfactualCostUsd)),
+    card('p95 latency', s.p95LatencyMs + ' ms', 'p50 ' + s.p50LatencyMs + ' · p99 ' + s.p99LatencyMs),
+    card('escalations', s.escalations, 'low-confidence retries'),
+    card('rejected', Number(s.rateLimited) + Number(s.quotaExceeded),
+         s.rateLimited + ' rate · ' + s.quotaExceeded + ' quota'),
+    card('failures', s.failures),
+  ].join('');
+
+  document.getElementById('providers').innerHTML = Object.entries(s.breakers).map(([name, b]) => `
+    <tr>
+      <td><code>${name}</code></td>
+      <td>${b.tier}</td>
+      <td>$${Number(b.costPer1kTokens).toFixed(2)}</td>
+      <td class="state ${b.state}">${b.state}</td>
+      <td><div class="bar"><i style="width:${(b.failureRate * 100).toFixed(0)}%"></i></div></td>
+      <td>${s.requestsByProvider[name] || 0}</td>
+    </tr>`).join('');
+}
+
+document.getElementById('ask').addEventListener('submit', async e => {
+  e.preventDefault();
+  const out = document.getElementById('out');
+  out.classList.remove('muted');
+  out.textContent = '…';
+  try {
+    const res = await fetch('/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': 'dashboard' },
+      body: JSON.stringify({ prompt: document.getElementById('prompt').value, maxTokens: 256 })
+    });
+    out.textContent = JSON.stringify(await res.json(), null, 2);
+  } catch (err) {
+    out.textContent = 'request failed: ' + err;
+  }
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

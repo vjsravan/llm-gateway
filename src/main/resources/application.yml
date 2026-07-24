@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: llm-gateway
+
+server:
+  port: 8080
+
+gateway:
+  # Conservative: a false cache hit serves a confidently wrong answer, which is worse
+  # than a miss and far harder to spot in aggregate metrics.
+  cache-similarity-threshold: 0.95
+  cache-ttl-seconds: 900
+  cache-max-entries: 5000
+  embedding-dimensions: 256
+
+  # Below this confidence the router escalates to a more capable, pricier tier.
+  escalation-confidence-threshold: 0.75
+
+  max-retry-attempts: 3
+  retry-base-delay-ms: 120
+  retry-max-delay-ms: 4000
+
+  rate-limit-burst: 20
+  rate-limit-per-second: 5.0
+  token-quota-per-window: 200000
+  quota-window-seconds: 3600
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-}] %logger{28} - %msg%n"
+  level:
+    dev.jsv.gateway: INFO
