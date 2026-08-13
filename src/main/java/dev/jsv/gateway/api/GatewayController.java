@@ -55,15 +55,17 @@ public class GatewayController {
                     ResponseEntity.ok(ChatResponse.from(s.result(), cid));
 
             case GatewayService.Outcome.Rejected r -> {
-                boolean isQuota = r.reason().contains("quota");
-                // 402 signals "this will not succeed until the window resets", which is
-                // a different instruction to the client than "slow down".
+                // 402 signals "this will not succeed until the window resets", which is a
+                // different instruction to the client than "slow down". The distinction
+                // comes off the enum the service already decided; re-deriving it by
+                // string-matching the message would silently break on a reworded message.
+                boolean isQuota = r.reason() == GatewayService.RejectionReason.TOKEN_QUOTA;
                 HttpStatus status = isQuota ? HttpStatus.PAYMENT_REQUIRED : HttpStatus.TOO_MANY_REQUESTS;
                 yield ResponseEntity.status(status)
                         .header("Retry-After", String.valueOf((long) Math.ceil(r.retryAfterSeconds())))
                         .body(new ErrorResponse(
                                 isQuota ? "quota_exceeded" : "rate_limited",
-                                r.reason(), r.retryAfterSeconds(), cid));
+                                r.detail(), r.retryAfterSeconds(), cid));
             }
 
             case GatewayService.Outcome.Failed f ->

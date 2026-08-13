@@ -72,8 +72,15 @@ import json, sys
 s = json.load(sys.stdin)
 hit_rate = s["cacheHitRate"] * 100
 saved_pct = s["costSavedRatio"] * 100
+# Rejected requests are reported alongside served ones so the accounting closes. A
+# rate-limited request never reaches a provider, so it is absent from "requests" — and
+# omitting it here made the header ("36 requests sent") silently disagree with the table.
+rejected = s["rateLimited"] + s["quotaExceeded"]
+
 rows = [
-    ("requests",            str(s["requests"])),
+    ("requests served",     str(s["requests"])),
+    ("requests rejected",   "%d  (%d rate-limited, %d over quota)"
+                            % (rejected, s["rateLimited"], s["quotaExceeded"])),
     ("cache hit rate",      "%.1f%%  (%d hits)" % (hit_rate, s["cacheHits"])),
     ("mean hit similarity", "%.4f" % s["meanHitSimilarity"]),
     ("escalations",         str(s["escalations"])),
@@ -81,7 +88,7 @@ rows = [
     ("if all-premium",      "$%.4f" % s["counterfactualCostUsd"]),
     ("cost saved",          "$%.4f  (%.1f%%)" % (s["costSavedUsd"], saved_pct)),
     ("p50 / p95 / p99",     "%d / %d / %d ms" % (s["p50LatencyMs"], s["p95LatencyMs"], s["p99LatencyMs"])),
-    ("failures",            str(s["failures"])),
+    ("provider failures",   str(s["failures"])),
 ]
 w = max(len(k) for k, _ in rows)
 for k, v in rows:

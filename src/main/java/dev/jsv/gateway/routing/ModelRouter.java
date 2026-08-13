@@ -65,7 +65,8 @@ public class ModelRouter {
      */
     public Decision route(String prompt, int maxTokens) throws ProviderException {
         List<String> attempted = new ArrayList<>();
-        Completion lowConfidence = null;
+        Completion bestBelowThreshold = null;
+        String firstLowConfidenceProvider = null;
         ProviderException lastFailure = null;
 
         for (LlmProvider provider : providers) {
@@ -79,44 +80,71 @@ public class ModelRouter {
 
             attempted.add(provider.name());
             try {
+                // The breaker is fed from *inside* the retry loop, so it sees every
+                // attempt rather than one verdict per logical call. Recording only the
+                // final outcome hides the most common degradation there is: a provider
+                // failing two attempts in three still succeeds, so it would report a
+                // 100% success rate and the breaker could never open — while every
+                // request quietly pays the full backoff.
                 Completion completion = retry.execute(
-                        () -> provider.complete(prompt, maxTokens),
+                        () -> {
+                            try {
+                                Completion c = provider.complete(prompt, maxTokens);
+                                breaker.recordSuccess();
+                                return c;
+                            } catch (ProviderException attemptFailure) {
+                                // Permanent failures stay out of the window: a malformed
+                                // prompt is the caller's fault, and letting it open the
+                                // circuit lets one bad client deny service to everyone.
+                                if (attemptFailure.isRetryable()) {
+                                    breaker.recordFailure();
+                                }
+                                throw attemptFailure;
+                            }
+                        },
                         (attempt, sleepMs, cause) -> log.debug(
                                 "retry {} of {} for {} in {}ms: {}",
                                 attempt, retry.maxAttempts(), provider.name(), sleepMs, cause.getMessage())
                 );
-                breaker.recordSuccess();
 
                 if (completion.confidence() >= escalationThreshold) {
                     return new Decision(
                             completion,
                             attempted,
-                            lowConfidence != null,
-                            lowConfidence == null
+                            firstLowConfidenceProvider != null,
+                            firstLowConfidenceProvider == null
                                     ? "confidence %.2f met threshold on first tier".formatted(completion.confidence())
-                                    : "escalated after low-confidence answer from " + lowConfidence.providerName()
+                                    : "escalated after low-confidence answer from " + firstLowConfidenceProvider
                     );
                 }
 
-                // Good enough to keep as a fallback, not good enough to return yet.
-                lowConfidence = completion;
+                // Good enough to keep as a fallback, not good enough to return yet. Keep
+                // the highest-confidence one rather than the most recent: tiers are tried
+                // cheapest-first, not best-first, so the last tier is not necessarily the
+                // strongest answer and returning it would mean paying for two calls to
+                // hand back the worse of the two.
+                if (bestBelowThreshold == null
+                        || completion.confidence() > bestBelowThreshold.confidence()) {
+                    bestBelowThreshold = completion;
+                }
+                if (firstLowConfidenceProvider == null) {
+                    firstLowConfidenceProvider = provider.name();
+                }
                 log.debug("confidence {} below threshold {} from {} — escalating",
                         completion.confidence(), escalationThreshold, provider.name());
 
             } catch (ProviderException e) {
                 lastFailure = e;
-                if (e.isRetryable()) {
-                    breaker.recordFailure();
-                }
                 log.warn("provider {} failed ({}): {}", provider.name(),
                         e.isRetryable() ? "retryable" : "permanent", e.getMessage());
             }
         }
 
         // Every tier was tried. A low-confidence answer beats no answer.
-        if (lowConfidence != null) {
-            return new Decision(lowConfidence, attempted, true,
-                    "all tiers below confidence threshold, returning best available");
+        if (bestBelowThreshold != null) {
+            return new Decision(bestBelowThreshold, attempted, true,
+                    "all tiers below confidence threshold, returning highest-confidence answer (%.2f from %s)"
+                            .formatted(bestBelowThreshold.confidence(), bestBelowThreshold.providerName()));
         }
 
         throw new ProviderException("router",
