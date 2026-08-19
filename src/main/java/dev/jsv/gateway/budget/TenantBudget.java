@@ -123,7 +123,9 @@ public class TenantBudget {
         }
     }
 
+    /** Snapshot, not the live key set — the previous version handed callers a view they
+     *  could remove buckets through. */
     public java.util.Set<String> knownTenants() {
-        return buckets.keySet();
+        return java.util.Set.copyOf(buckets.keySet());
     }
 }

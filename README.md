@@ -8,15 +8,17 @@ Runs with no API keys and no network: simulated providers are wired in by defaul
 `mvn spring-boot:run` gives you a working gateway and a live dashboard immediately.
 
 ```bash
-mvn test              # 53 tests
+mvn test              # 61 tests
 mvn spring-boot:run   # dashboard at http://localhost:8080
 ./benchmark.sh        # drives representative traffic, prints measured results
 ```
 
-![LLM Gateway dashboard showing 36 requests, 69.4% cache hit rate, $5.61 cost saved, p95 latency, and per-provider circuit breaker state](docs/dashboard.png)
+![LLM Gateway dashboard: request and cache-hit tiles, cost saved against the all-premium counterfactual, latency percentiles, rejected and failed counts, and a per-provider table showing each circuit breaker's state and rolling failure rate](docs/dashboard.png)
 
-*The dashboard after one `./benchmark.sh` run. Every number is live from `/v1/stats`;
-the provider table shows each circuit breaker's state and rolling failure rate.*
+*The dashboard after a `./benchmark.sh` run. Every number is live from `/v1/stats`; the
+provider table shows each circuit breaker's state and rolling failure rate. The figures
+below are the authoritative ones — rerun the benchmark and the dashboard will show
+whatever your own run produced.*
 
 ---
 
@@ -44,18 +46,24 @@ base questions asked repeatedly with harmless rewording, plus one long open-ende
 request):
 
 ```
-  requests              36
-  cache hit rate        58.3%  (21 hits)
+  requests served       36
+  requests rejected     0  (0 rate-limited, 0 over quota)
+  cache hit rate        52.8%  (19 hits)
   mean hit similarity   0.9904
   escalations           1
-  actual spend          $0.6182
-  if all-premium        $6.4200
-  cost saved            $5.8017  (90.4%)
-  p50 / p95 / p99       10 / 100 / 400 ms
-  failures              0
+  actual spend          $0.6507
+  if all-premium        $6.5430
+  cost saved            $5.8922  (90.0%)
+  p50 / p95 / p99       10 / 400 / 400 ms
+  provider failures     0
 
-  by provider: {"cache": 21, "sim-small": 14, "sim-large": 1}
+  by provider: {"cache": 19, "sim-small": 16, "sim-large": 1}
 ```
+
+Served plus rejected equals sent, and the per-provider counts sum to served. That is
+deliberate: an earlier version of the script printed only `requests`, so a rate-limited
+request vanished between the header and the table and the two quietly disagreed by one.
+A benchmark whose own arithmetic does not close is not evidence of anything.
 
 **These are simulated-provider numbers, not a claim about production.** They demonstrate
 that the mechanisms work and are instrumented; the absolute figures depend entirely on
@@ -80,6 +88,18 @@ Budget rejection is free, so it happens first — no sense embedding a prompt fo
 that is over quota. The cache runs before any provider call because a hit costs one
 embedding instead of one inference. Routing is last because it is the only step that
 spends real money.
+
+### The cache is scoped to a tenant, and the scope is not optional
+
+`SemanticCache.lookup` takes a tenant id and there is no overload that omits it. A shared
+cache on a multi-tenant gateway hands one customer's stored answer to another, and the
+prompts collide *precisely because* different customers ask the same questions — so the
+leak is likeliest on exactly the traffic the cache is best at. A signature that cannot
+express the bug is worth more than a comment warning against it.
+
+Entries also carry the caller's `maxTokens`: a completion generated under a larger cap can
+be longer than the current caller asked for, so entries that do not fit are skipped rather
+than truncated. A truncated cached answer is a different answer.
 
 ### The cache threshold is a correctness decision, not a tuning knob
 
@@ -120,6 +140,13 @@ second one is usually longer than the first.
 **Permanent failures do not trip the breaker.** A 400 for a malformed prompt is the
 caller's fault; letting it open the circuit means one bad client can deny service to
 everyone. Only retryable failures count.
+
+**The breaker is fed from inside the retry loop, not outside it.** This is the one that
+looks like a detail and is not. A provider that fails two attempts in three still returns
+a successful answer to the caller, so recording one outcome per logical call reports a
+100% success rate — the breaker can never open, while every single request quietly pays
+the full backoff. Degraded-but-recovering is the most common way a provider misbehaves,
+and it is exactly the case a per-call breaker is blind to.
 
 ### Retry jitter is not decoration
 
@@ -210,14 +237,14 @@ depends on it.
 
 ## Tests
 
-53 tests, no mocking framework required — the seams are constructor arguments.
+61 tests, no mocking framework required — the seams are constructor arguments.
 
 | area | covers |
 |---|---|
 | `ResilienceTest` | breaker state machine, probe budget, minimum-sample floor, backoff bounds, jitter, permanent-vs-retryable |
-| `CacheAndRoutingTest` | cache hit/miss/TTL/LRU, embedder determinism and word order, tier selection, escalation, failover, open-breaker skip |
+| `CacheAndRoutingTest` | cache hit/miss/TTL/LRU, **per-tenant isolation**, `maxTokens` fit, index/eviction consistency, embedder determinism and word order, tier selection, escalation, **highest-confidence fallback**, failover, open-breaker skip, **breaker visibility through retries** |
 | `TenantBudgetTest` | burst, gradual refill, tenant isolation, quota exhaustion and window rollover |
-| `GatewayApiTest` | full Spring context — status codes, validation, `Retry-After`, cache transparency, stats, health |
+| `GatewayApiTest` | full Spring context — status codes, validation, `Retry-After`, **cross-tenant cache isolation over HTTP**, cache transparency, stats, health |
 
 Each API test uses a distinct tenant id so the shared rate limiter cannot leak state
 between tests. A suite whose result depends on execution order is worse than no suite,

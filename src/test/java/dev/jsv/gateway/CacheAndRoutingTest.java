@@ -58,9 +58,48 @@ class CacheAndRoutingTest {
         }
     }
 
+    /**
+     * Fails the first {@code failuresPerCall} attempts of every logical call, then
+     * succeeds — the degraded-but-recovering shape a retry loop hides from the breaker.
+     */
+    private static final class FlakyProvider implements LlmProvider {
+        private final String name;
+        private final int tier;
+        private final int failuresPerCall;
+        private int consecutiveFailures = 0;
+        final AtomicInteger successes = new AtomicInteger();
+        final AtomicInteger failures = new AtomicInteger();
+
+        FlakyProvider(String name, int tier, int failuresPerCall) {
+            this.name = name;
+            this.tier = tier;
+            this.failuresPerCall = failuresPerCall;
+        }
+
+        public String name() { return name; }
+        public double costPer1kTokens() { return 0.25; }
+        public int tier() { return tier; }
+
+        public Completion complete(String prompt, int maxTokens) throws ProviderException {
+            if (consecutiveFailures < failuresPerCall) {
+                consecutiveFailures++;
+                failures.incrementAndGet();
+                throw new ProviderException(name, "transient 503", true);
+            }
+            consecutiveFailures = 0;
+            successes.incrementAndGet();
+            return new Completion("answer from " + name, 10, 20, 0.99, name);
+        }
+    }
+
     private static Completion sample() {
         return new Completion("cached answer", 10, 20, 0.9, "stub");
     }
+
+    /** Larger than any sample()'s output, so maxTokens never accidentally filters a test. */
+    private static final int ANY_TOKENS = 4096;
+
+    private static final String TENANT = "acme";
 
     @Nested
     @DisplayName("SemanticCache")
@@ -70,7 +109,7 @@ class CacheAndRoutingTest {
         @DisplayName("returns a miss on an empty cache")
         void missesWhenEmpty() {
             SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
-            assertTrue(cache.lookup("anything").isEmpty());
+            assertTrue(cache.lookup(TENANT, "anything", ANY_TOKENS).isEmpty());
             assertEquals(0.0, cache.stats().hitRate());
         }
 
@@ -78,9 +117,10 @@ class CacheAndRoutingTest {
         @DisplayName("hits on an identical prompt")
         void hitsOnExactMatch() {
             SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
-            cache.put("what is the status of AWB 125", sample());
+            cache.put(TENANT, "what is the status of AWB 125", sample());
 
-            Optional<SemanticCache.Hit> hit = cache.lookup("what is the status of AWB 125");
+            Optional<SemanticCache.Hit> hit =
+                    cache.lookup(TENANT, "what is the status of AWB 125", ANY_TOKENS);
             assertTrue(hit.isPresent());
             assertEquals(1.0, hit.get().similarity(), 1e-6);
         }
@@ -91,8 +131,57 @@ class CacheAndRoutingTest {
             // The dangerous failure is a false hit: a confidently wrong answer to a
             // question nobody asked, nearly invisible in aggregate metrics.
             SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
-            cache.put("what is the status of AWB 125", sample());
-            assertTrue(cache.lookup("summarise the quarterly revenue forecast").isEmpty());
+            cache.put(TENANT, "what is the status of AWB 125", sample());
+            assertTrue(cache.lookup(TENANT, "summarise the quarterly revenue forecast", ANY_TOKENS)
+                    .isEmpty());
+        }
+
+        @Test
+        @DisplayName("never serves one tenant's entry to another")
+        void isolatesTenants() {
+            // The prompts collide precisely because different customers ask the same
+            // questions, so a shared cache leaks hardest on exactly the traffic it is
+            // best at. An identical prompt from a different tenant must be a miss.
+            SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
+            String prompt = "what is the outstanding balance on account 4471-8890";
+
+            cache.put("acme", prompt, sample());
+
+            assertTrue(cache.lookup("globex", prompt, ANY_TOKENS).isEmpty(),
+                    "globex must not see acme's cached completion");
+            assertTrue(cache.lookup("acme", prompt, ANY_TOKENS).isPresent(),
+                    "acme must still hit its own entry");
+            assertEquals(1, cache.sizeFor("acme"));
+            assertEquals(0, cache.sizeFor("globex"));
+        }
+
+        @Test
+        @DisplayName("keeps per-tenant entries separate under the same prompt")
+        void storesPerTenantCopies() {
+            SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
+            String prompt = "what is my current quota";
+
+            cache.put("acme", prompt, new Completion("acme answer", 5, 5, 0.9, "stub"));
+            cache.put("globex", prompt, new Completion("globex answer", 5, 5, 0.9, "stub"));
+
+            assertEquals("acme answer",
+                    cache.lookup("acme", prompt, ANY_TOKENS).orElseThrow().completion().text());
+            assertEquals("globex answer",
+                    cache.lookup("globex", prompt, ANY_TOKENS).orElseThrow().completion().text());
+            assertEquals(2, cache.stats().size());
+        }
+
+        @Test
+        @DisplayName("skips an entry longer than the caller's maxTokens")
+        void respectsMaxTokens() {
+            // Returning a 200-token cached answer to a caller who asked for 50 breaks a
+            // limit they set deliberately, and truncating it would be a different answer.
+            SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
+            cache.put(TENANT, "summarise the shipment", new Completion("long", 10, 200, 0.9, "stub"));
+
+            assertTrue(cache.lookup(TENANT, "summarise the shipment", 50).isEmpty(),
+                    "a 200-token entry must not serve a 50-token request");
+            assertTrue(cache.lookup(TENANT, "summarise the shipment", 256).isPresent());
         }
 
         @Test
@@ -100,11 +189,12 @@ class CacheAndRoutingTest {
         void expiresEntries() throws Exception {
             SemanticCache cache = new SemanticCache(
                     new HashingEmbedder(), 0.9, Duration.ofMillis(50), 100);
-            cache.put("prompt one", sample());
-            assertTrue(cache.lookup("prompt one").isPresent());
+            cache.put(TENANT, "prompt one", sample());
+            assertTrue(cache.lookup(TENANT, "prompt one", ANY_TOKENS).isPresent());
 
             Thread.sleep(80);
-            assertTrue(cache.lookup("prompt one").isEmpty(), "entry should have expired");
+            assertTrue(cache.lookup(TENANT, "prompt one", ANY_TOKENS).isEmpty(),
+                    "entry should have expired");
         }
 
         @Test
@@ -113,19 +203,33 @@ class CacheAndRoutingTest {
             SemanticCache cache = new SemanticCache(
                     new HashingEmbedder(), 0.99, Duration.ofMinutes(10), 3);
             for (int i = 0; i < 6; i++) {
-                cache.put("distinct prompt number " + i, sample());
+                cache.put(TENANT, "distinct prompt number " + i, sample());
             }
             assertEquals(3, cache.stats().size());
             assertTrue(cache.stats().evictions() >= 3);
         }
 
         @Test
+        @DisplayName("keeps the tenant index in step with eviction")
+        void evictionDoesNotStrandTheIndex() {
+            // The scan index mirrors the LRU. If eviction forgets to unindex, the index
+            // grows without bound and lookup starts scanning entries that no longer exist.
+            SemanticCache cache = new SemanticCache(
+                    new HashingEmbedder(), 0.99, Duration.ofMinutes(10), 3);
+            for (int i = 0; i < 10; i++) {
+                cache.put(TENANT, "distinct prompt number " + i, sample());
+            }
+            assertEquals(3, cache.stats().size());
+            assertEquals(3, cache.sizeFor(TENANT), "index must not outlive the entries it mirrors");
+        }
+
+        @Test
         @DisplayName("tracks hit rate and mean similarity")
         void tracksStats() {
             SemanticCache cache = SemanticCache.withDefaults(new HashingEmbedder());
-            cache.put("hello world", sample());
-            cache.lookup("hello world");
-            cache.lookup("totally different question about something else");
+            cache.put(TENANT, "hello world", sample());
+            cache.lookup(TENANT, "hello world", ANY_TOKENS);
+            cache.lookup(TENANT, "totally different question about something else", ANY_TOKENS);
 
             SemanticCache.Stats stats = cache.stats();
             assertEquals(1, stats.hits());
@@ -233,7 +337,60 @@ class CacheAndRoutingTest {
             ModelRouter.Decision d = router.route("impossible question", 100);
 
             assertNotNull(d.completion(), "a weak answer beats no answer");
+            assertEquals("pricey", d.completion().providerName());
             assertTrue(d.escalated());
+        }
+
+        @Test
+        @DisplayName("the fallback is the highest-confidence answer, not the last tier tried")
+        void fallbackPicksBestConfidenceNotLastTried() throws Exception {
+            // Tiers are tried cheapest-first, not best-first. When the cheap tier scores
+            // higher than the expensive one and neither clears the bar, returning "the
+            // last one" means paying for two calls to hand back the worse answer.
+            StubProvider cheap = StubProvider.ok("cheap", 1, 0.25, 0.70);
+            StubProvider pricey = StubProvider.ok("pricey", 2, 3.00, 0.50);
+            ModelRouter router = new ModelRouter(List.of(cheap, pricey), fastRetry, 0.95);
+
+            ModelRouter.Decision d = router.route("hard question", 100);
+
+            assertEquals("cheap", d.completion().providerName(),
+                    "the 0.70 answer beats the 0.50 answer regardless of tier order");
+            assertEquals(0.70, d.completion().confidence(), 1e-9);
+            assertTrue(d.reason().contains("highest-confidence"));
+        }
+
+        @Test
+        @DisplayName("the breaker counts attempts the retry loop absorbs")
+        void breakerSeesFailuresHiddenByRetries() throws Exception {
+            // A provider that fails twice and succeeds on the third attempt is degraded,
+            // but every logical call still ends in success. Recording one outcome per
+            // call would report a 100% success rate, so the breaker could never open
+            // while every request silently paid the full backoff.
+            FlakyProvider flaky = new FlakyProvider("flaky", 1, 2);
+            StubProvider healthy = StubProvider.ok("healthy", 2, 3.00, 0.99);
+            RetryExecutor retry = new RetryExecutor(3, Duration.ofMillis(1), Duration.ofMillis(2));
+            ModelRouter router = new ModelRouter(List.of(flaky, healthy), retry, 0.75);
+
+            for (int i = 0; i < 4; i++) {
+                router.route("question " + i, 100);
+            }
+
+            assertTrue(flaky.successes.get() > 0, "every call should still have succeeded");
+            assertEquals(CircuitBreaker.State.OPEN, router.breakerFor("flaky").state(),
+                    "a provider failing 2 attempts in 3 must eventually trip the breaker");
+        }
+
+        @Test
+        @DisplayName("a permanent failure inside the retry loop still does not trip the breaker")
+        void permanentFailurePerAttemptDoesNotTripBreaker() throws Exception {
+            StubProvider badRequest = StubProvider.failing("strict", 1, false);
+            StubProvider healthy = StubProvider.ok("healthy", 2, 3.00, 0.99);
+            ModelRouter router = new ModelRouter(List.of(badRequest, healthy), fastRetry, 0.75);
+
+            for (int i = 0; i < 20; i++) {
+                router.route("malformed " + i, 100);
+            }
+            assertEquals(CircuitBreaker.State.CLOSED, router.breakerFor("strict").state());
         }
 
         @Test

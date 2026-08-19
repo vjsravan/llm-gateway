@@ -66,9 +66,14 @@ public class GatewayService {
             long latencyMs
     ) {}
 
+    /** Why a request was turned away. Carried as a type, not sniffed back out of a
+     *  message string — the distinction is what tells the caller whether retrying can
+     *  ever help, so it has to survive the trip to the controller. */
+    public enum RejectionReason { RATE_LIMIT, TOKEN_QUOTA }
+
     public sealed interface Outcome permits Outcome.Success, Outcome.Rejected, Outcome.Failed {
         record Success(Result result) implements Outcome {}
-        record Rejected(String reason, double retryAfterSeconds) implements Outcome {}
+        record Rejected(RejectionReason reason, String detail, double retryAfterSeconds) implements Outcome {}
         record Failed(String reason) implements Outcome {}
     }
 
@@ -83,18 +88,19 @@ public class GatewayService {
             if (verdict instanceof TenantBudget.Verdict.RateLimited limited) {
                 metrics.recordRateLimited();
                 log.info("rate limited, retry after {}s", limited.retryAfterSeconds());
-                return new Outcome.Rejected("rate limit exceeded", limited.retryAfterSeconds());
+                return new Outcome.Rejected(RejectionReason.RATE_LIMIT,
+                        "rate limit exceeded", limited.retryAfterSeconds());
             }
             if (verdict instanceof TenantBudget.Verdict.QuotaExceeded quota) {
                 metrics.recordQuotaExceeded();
                 log.info("quota exceeded: {}/{} tokens", quota.used(), quota.limit());
-                return new Outcome.Rejected(
+                return new Outcome.Rejected(RejectionReason.TOKEN_QUOTA,
                         "token quota exceeded (%d/%d)".formatted(quota.used(), quota.limit()),
                         quota.resetsIn().toSeconds());
             }
 
-            // ── 2. Semantic cache ──
-            Optional<SemanticCache.Hit> hit = cache.lookup(prompt);
+            // ── 2. Semantic cache, scoped to this tenant ──
+            Optional<SemanticCache.Hit> hit = cache.lookup(tenantId, prompt, maxTokens);
             if (hit.isPresent()) {
                 SemanticCache.Hit h = hit.get();
                 long latencyMs = elapsedMs(started);
@@ -127,8 +133,8 @@ public class GatewayService {
             double wouldHaveCost = costOf(completion.totalTokens(), premiumCostPer1k);
             metrics.recordCost(spent, wouldHaveCost);
 
-            // ── 4. Populate the cache for the next equivalent prompt ──
-            cache.put(prompt, completion);
+            // ── 4. Populate this tenant's cache for the next equivalent prompt ──
+            cache.put(tenantId, prompt, completion);
 
             log.info("served by {} escalated={} tokens={} cost={} latency={}ms",
                     completion.providerName(), decision.escalated(),

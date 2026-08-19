@@ -56,6 +56,39 @@ class GatewayApiTest {
     }
 
     @Test
+    @DisplayName("one tenant's cached answer is never served to another")
+    void cacheIsScopedToTheTenant() throws Exception {
+        // The end-to-end form of the isolation guarantee: identical prompts, two tenants,
+        // and the second must still reach a provider rather than being handed the first
+        // tenant's stored response body.
+        String prompt = "what is the outstanding balance on account 4471-8890";
+
+        mvc.perform(post("/v1/chat")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Tenant-Id", "api-isolation-a")
+                        .content(body(prompt)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cacheHit").value(false));
+
+        // Same tenant, same prompt: this one should hit, proving the cache is live.
+        mvc.perform(post("/v1/chat")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Tenant-Id", "api-isolation-a")
+                        .content(body(prompt)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cacheHit").value(true));
+
+        // Different tenant, identical prompt: must be a miss.
+        mvc.perform(post("/v1/chat")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Tenant-Id", "api-isolation-b")
+                        .content(body(prompt)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cacheHit").value(false))
+                .andExpect(jsonPath("$.servedBy").value(org.hamcrest.Matchers.not("cache")));
+    }
+
+    @Test
     @DisplayName("echoes a supplied correlation id for tracing")
     void propagatesCorrelationId() throws Exception {
         mvc.perform(post("/v1/chat")
