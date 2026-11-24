@@ -17,7 +17,7 @@ mvn spring-boot:run   # dashboard at http://localhost:8080
 
 *The dashboard after a `./benchmark.sh` run. Every number is live from `/v1/stats`; the
 provider table shows each circuit breaker's state and rolling failure rate. The figures
-below are the authoritative ones — rerun the benchmark and the dashboard will show
+below are the authoritative ones rerun the benchmark and the dashboard will show
 whatever your own run produced.*
 
 ---
@@ -111,7 +111,7 @@ auditable after the fact.
 
 The bundled `HashingEmbedder` is lexical, not semantic: it matches on word and bigram
 overlap, so "cancel my order" and "I'd like a refund" will *not* match. That is a
-deliberate floor rather than a limitation to hide — it keeps the cache honest offline and
+deliberate floor rather than a limitation to hide it keeps the cache honest offline and
 makes its behaviour reproducible in tests. Swap in a real embedding endpoint behind the
 `Embedder` interface and the cache logic is unchanged.
 
